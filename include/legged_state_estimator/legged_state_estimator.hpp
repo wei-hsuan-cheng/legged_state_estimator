@@ -2,6 +2,7 @@
 #define LEGGED_STATE_ESTIMATOR_LEGGED_STATE_ESTIMATOR_HPP_
 
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Eigen/Core"
@@ -104,6 +105,16 @@ public:
               const Eigen::VectorXd& tauJ);
 
   ///
+  /// @brief Updates the state estimation using externally supplied contact states.
+  /// @param[in] contact_state Contact ID and active state for every configured contact.
+  ///
+  void update(const Eigen::Vector3d& imu_gyro_raw,
+              const Eigen::Vector3d& imu_lin_accel_raw,
+              const Eigen::VectorXd& qJ, const Eigen::VectorXd& dqJ,
+              const Eigen::VectorXd& tauJ,
+              const std::vector<std::pair<int, bool>>& contact_state);
+
+  ///
   /// @return const reference to the base position estimate.
   ///
   const Eigen::Vector3d& getBasePositionEstimate() const;
@@ -182,6 +193,12 @@ public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 
 private:
+  void updateImpl(const Eigen::Vector3d& imu_gyro_raw,
+                  const Eigen::Vector3d& imu_lin_accel_raw,
+                  const Eigen::VectorXd& qJ, const Eigen::VectorXd& dqJ,
+                  const Eigen::VectorXd& tauJ,
+                  const std::vector<std::pair<int, bool>>* external_contact_state);
+
   LeggedStateEstimatorSettings settings_;
   InEKF inekf_;
   vectorKinematics leg_kinematics_;

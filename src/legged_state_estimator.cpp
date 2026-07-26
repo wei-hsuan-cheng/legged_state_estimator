@@ -1,5 +1,6 @@
 #include "legged_state_estimator/legged_state_estimator.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -138,6 +139,28 @@ void LeggedStateEstimator::update(const Eigen::Vector3d& imu_gyro_raw,
                                   const Eigen::VectorXd& qJ, 
                                   const Eigen::VectorXd& dqJ, 
                                   const Eigen::VectorXd& tauJ) {
+  updateImpl(imu_gyro_raw, imu_lin_accel_raw, qJ, dqJ, tauJ, nullptr);
+}
+
+
+void LeggedStateEstimator::update(
+    const Eigen::Vector3d& imu_gyro_raw,
+    const Eigen::Vector3d& imu_lin_accel_raw,
+    const Eigen::VectorXd& qJ,
+    const Eigen::VectorXd& dqJ,
+    const Eigen::VectorXd& tauJ,
+    const std::vector<std::pair<int, bool>>& contact_state) {
+  updateImpl(imu_gyro_raw, imu_lin_accel_raw, qJ, dqJ, tauJ, &contact_state);
+}
+
+
+void LeggedStateEstimator::updateImpl(
+    const Eigen::Vector3d& imu_gyro_raw,
+    const Eigen::Vector3d& imu_lin_accel_raw,
+    const Eigen::VectorXd& qJ,
+    const Eigen::VectorXd& dqJ,
+    const Eigen::VectorXd& tauJ,
+    const std::vector<std::pair<int, bool>>* external_contact_state) {
   if (qJ.size() != robot_model_.nJ()) {
     throw std::invalid_argument(
         "[LeggedStateEstimator] invalid argment: qJ.size() must be " + std::to_string(robot_model_.nJ()));
@@ -149,6 +172,22 @@ void LeggedStateEstimator::update(const Eigen::Vector3d& imu_gyro_raw,
   if (tauJ.size() != robot_model_.nJ()) {
     throw std::invalid_argument(
         "[LeggedStateEstimator] invalid argment: tauJ.size() must be " + std::to_string(robot_model_.nJ()));
+  }
+  if (external_contact_state != nullptr) {
+    if (external_contact_state->size() != static_cast<size_t>(robot_model_.numContacts())) {
+      throw std::invalid_argument(
+          "[LeggedStateEstimator] external contact_state must have one entry per configured contact");
+    }
+    std::vector<bool> contact_id_seen(static_cast<size_t>(robot_model_.numContacts()), false);
+    for (const auto& contact : *external_contact_state) {
+      const int contact_id = contact.first;
+      if (contact_id < 0 || contact_id >= robot_model_.numContacts() ||
+          contact_id_seen[static_cast<size_t>(contact_id)]) {
+        throw std::invalid_argument(
+            "[LeggedStateEstimator] external contact_state IDs must be unique and in range");
+      }
+      contact_id_seen[static_cast<size_t>(contact_id)] = true;
+    }
   }
   // Process IMU measurements in InEKF
   imu_raw_.template head<3>() = imu_gyro_raw;
@@ -174,21 +213,31 @@ void LeggedStateEstimator::update(const Eigen::Vector3d& imu_gyro_raw,
   lpf_tauJ_.update(tauJ);
   // Update contact info
   robot_model_.updateLegKinematics(qJ);
-  if (settings_.dynamic_contact_estimation) {
-    robot_model_.updateDynamics(getBasePositionEstimate(), getBaseQuaternionEstimate(),
-                                getBaseLinearVelocityEstimateLocal(), imu_gyro_raw,
-                                imu_lin_accel_local_, imu_gyro_accel_local_,
-                                qJ, dqJ, lpf_ddqJ_.getEstimate());
+  if (external_contact_state != nullptr) {
+    inekf_.setContacts(*external_contact_state);
   }
   else {
-    robot_model_.updateLegDynamics(qJ, dqJ);
+    if (settings_.dynamic_contact_estimation) {
+      robot_model_.updateDynamics(getBasePositionEstimate(), getBaseQuaternionEstimate(),
+                                  getBaseLinearVelocityEstimateLocal(), imu_gyro_raw,
+                                  imu_lin_accel_local_, imu_gyro_accel_local_,
+                                  qJ, dqJ, lpf_ddqJ_.getEstimate());
+    }
+    else {
+      robot_model_.updateLegDynamics(qJ, dqJ);
+    }
+    contact_estimator_.update(robot_model_, lpf_tauJ_.getEstimate());
+    inekf_.setContacts(contact_estimator_.getContactState());
   }
-  contact_estimator_.update(robot_model_, lpf_tauJ_.getEstimate());
-  inekf_.setContacts(contact_estimator_.getContactState());
+  const double minimum_contact_covariance =
+      settings_.contact_position_noise * settings_.contact_position_noise;
   for (int i=0; i<robot_model_.numContacts(); ++i) {
     leg_kinematics_[i].setContactPosition(
         robot_model_.getContactPosition(i)-robot_model_.getBasePosition());
-    const double contact_force_cov = contact_estimator_.getContactForceCovariance()[i];
+    const double contact_force_cov = external_contact_state != nullptr ?
+        minimum_contact_covariance :
+        std::max(minimum_contact_covariance,
+                 contact_estimator_.getContactForceCovariance()[i]);
     leg_kinematics_[i].setContactPositionCovariance(
         contact_force_cov*Eigen::Matrix3d::Identity());
   }
