@@ -24,9 +24,9 @@ endif()
 #############
 ## Options ##
 #############
-option(OPTIMIZE_FOR_NATIVE "Enable -march=native" ON)
-option(BUILD_PYTHON_INTERFACE "Build Python bindings" ON)
-option(BUILD_EXAMPLES "Build examples and tests" ON)
+option(OPTIMIZE_FOR_NATIVE "Enable -march=native" OFF)
+option(BUILD_PYTHON_INTERFACE "Build Python bindings" OFF)
+option(BUILD_EXAMPLES "Build examples and tests" OFF)
 
 
 ###########
