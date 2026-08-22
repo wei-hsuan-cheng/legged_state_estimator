@@ -94,7 +94,37 @@ void LeggedStateEstimator::init(const Eigen::Vector3d& base_pos,
   initial_state.setVelocity(base_lin_vel_world);
   initial_state.setGyroscopeBias(imu_gyro_bias);
   initial_state.setAccelerometerBias(imu_lin_accel_bias);
-  inekf_.setState(initial_state);
+
+  // The initial covariance says how much the seed above is trusted. Leaving it
+  // at the InEKFState default of identity claims sigma = 1 rad on attitude,
+  // 1 m/s on velocity and 1 m on position for a state that was just seeded from
+  // a known pose; the first contact correction, whose noise is millimetres, then
+  // yanks the state hard. Settings carry explicit std-devs instead.
+  const auto square = [](const double sigma) { return sigma * sigma; };
+  initial_state.setRotationCovariance(
+      square(settings_.initial_attitude_noise) * Eigen::Matrix3d::Identity());
+  initial_state.setVelocityCovariance(
+      square(settings_.initial_velocity_noise) * Eigen::Matrix3d::Identity());
+  initial_state.setPositionCovariance(
+      square(settings_.initial_position_noise) * Eigen::Matrix3d::Identity());
+  initial_state.setGyroscopeBiasCovariance(
+      square(settings_.initial_gyroscope_bias_noise) * Eigen::Matrix3d::Identity());
+  initial_state.setAccelerometerBiasCovariance(
+      square(settings_.initial_accelerometer_bias_noise) * Eigen::Matrix3d::Identity());
+
+  // resetState(), not setState(): the augmented contact/landmark maps index into
+  // the state matrix X, so a stale entry left from a previous activation would
+  // index past the end of the freshly assigned 5x5 X on the next correction.
+  // That made any deactivate -> activate cycle undefined behaviour.
+  inekf_.resetState(initial_state);
+  inekf_.setEstimateBias(settings_.estimate_imu_bias);
+
+  imu_gyro_raw_world_.setZero();
+  imu_gyro_raw_world_prev_.setZero();
+  imu_gyro_accel_world_.setZero();
+  imu_gyro_accel_local_.setZero();
+  imu_lin_accel_raw_world_.setZero();
+  imu_lin_accel_local_.setZero();
 
   lpf_gyro_accel_world_.reset();
   lpf_lin_accel_world_.reset();
@@ -249,8 +279,13 @@ void LeggedStateEstimator::updateImpl(
   base_quat_estimate_ = Eigen::Quaterniond(inekf_.getState().getRotation()).coeffs();
   base_lin_vel_world_estimate_ = inekf_.getState().getVelocity();
   base_lin_vel_local_estimate_ = inekf_.getState().getRotation().transpose() * base_lin_vel_world_estimate_;
-  base_ang_vel_world_estimate_ = imu_gyro_raw_world_;
-  base_ang_vel_local_estimate_ = imu_gyro_raw - getIMUGyroBiasEstimate();
+  base_ang_vel_local_estimate_ = imu_gyro_raw - inekf_.getState().getGyroscopeBias();
+  // This used to be assigned imu_gyro_raw_world_, which is only ever written
+  // inside the dynamic_contact_estimation branch above - so with that option off
+  // (the common case) the world angular velocity was reported as exactly zero
+  // forever. Derive it from the local estimate and the corrected rotation, which
+  // is also more accurate than the pre-correction value that variable holds.
+  base_ang_vel_world_estimate_.noalias() = base_rot_estimate_ * base_ang_vel_local_estimate_;
   imu_gyro_bias_estimate_ = inekf_.getState().getGyroscopeBias();
   imu_lin_acc_bias_estimate_ = inekf_.getState().getAccelerometerBias();
 }
@@ -323,6 +358,56 @@ const ContactEstimator& LeggedStateEstimator::getContactEstimator() const {
 
 const LeggedStateEstimatorSettings& LeggedStateEstimator::getSettings() const {
   return settings_;
+}
+
+
+const InEKF& LeggedStateEstimator::getInEKF() const {
+  return inekf_;
+}
+
+
+const CorrectionInfo& LeggedStateEstimator::getLastCorrection() const {
+  return inekf_.getLastCorrection();
+}
+
+
+namespace {
+// The covariance blocks are symmetric positive semi-definite in exact
+// arithmetic, but a diagonal entry can go marginally negative through round-off;
+// clamp before the square root so a diagnostic never returns NaN.
+Eigen::Vector3d blockStdDev(const Eigen::Block<const Eigen::MatrixXd, 3, 3>& block) {
+  return block.diagonal().cwiseMax(0.0).cwiseSqrt();
+}
+} // namespace
+
+
+Eigen::Vector3d LeggedStateEstimator::getAttitudeStdDev() const {
+  return blockStdDev(inekf_.getState().getRotationCovariance());
+}
+
+
+Eigen::Vector3d LeggedStateEstimator::getVelocityStdDev() const {
+  return blockStdDev(inekf_.getState().getVelocityCovariance());
+}
+
+
+Eigen::Vector3d LeggedStateEstimator::getPositionStdDev() const {
+  return blockStdDev(inekf_.getState().getPositionCovariance());
+}
+
+
+Eigen::Vector3d LeggedStateEstimator::getGyroscopeBiasStdDev() const {
+  return blockStdDev(inekf_.getState().getGyroscopeBiasCovariance());
+}
+
+
+Eigen::Vector3d LeggedStateEstimator::getAccelerometerBiasStdDev() const {
+  return blockStdDev(inekf_.getState().getAccelerometerBiasCovariance());
+}
+
+
+int LeggedStateEstimator::getNumAugmentedContacts() const {
+  return static_cast<int>(inekf_.getEstimatedContactPositions().size());
 }
 
 } // namespace legged_state_estimator

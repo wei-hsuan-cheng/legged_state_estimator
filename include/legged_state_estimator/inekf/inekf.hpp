@@ -33,6 +33,49 @@ namespace legged_state_estimator {
 
 enum ErrorType {LeftInvariant, RightInvariant};
 
+/**
+ * Diagnostics of the most recent measurement update.
+ *
+ * The filter is otherwise a black box between Propagate() and the exported mean:
+ * whether a correction actually fired, how large the innovation was relative to
+ * its own predicted covariance, and how many contacts took part are the three
+ * quantities needed to tell "the filter is confident and right" apart from "the
+ * filter is confident and wrong". `nis` is the normalized innovation squared,
+ * r^T S^-1 r, which for a consistent filter is chi-squared distributed with
+ * `dim` degrees of freedom.
+ */
+struct CorrectionInfo {
+  /// True when a correction was applied on the last CorrectKinematics() call.
+  bool applied = false;
+  /// Number of stacked scalar measurements (3 per corrected contact).
+  int dim = 0;
+  /// Stacked innovation r.
+  Eigen::VectorXd innovation;
+  /// Per-element predicted innovation standard deviation, sqrt(diag(S)).
+  Eigen::VectorXd innovation_std;
+  /// Normalized innovation squared, r^T S^-1 r.
+  double nis = 0.0;
+  /// IDs of the contacts that contributed, in the order they were stacked.
+  std::vector<int> contact_ids;
+  /// Contacts newly augmented into the state on this call (touchdown).
+  std::vector<int> added_contact_ids;
+  /// Contacts marginalized out of the state on this call (liftoff).
+  std::vector<int> removed_contact_ids;
+
+  void clear() {
+    applied = false;
+    dim = 0;
+    innovation.resize(0);
+    innovation_std.resize(0);
+    nis = 0.0;
+    contact_ids.clear();
+    added_contact_ids.clear();
+    removed_contact_ids.clear();
+  }
+
+  EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+};
+
 class InEKF {
 public:
 /// @name Constructors
@@ -117,6 +160,16 @@ the default.
    * @return  magnetic field in world frame
    */
   const Eigen::Vector3d& getMagneticField() const;
+  /**
+   * Gets diagnostics of the most recent measurement update. Valid until the next
+   * call to CorrectKinematics() / CorrectLandmarks().
+   */
+  const CorrectionInfo& getLastCorrection() const;
+  /**
+   * True when the IMU bias states are estimated. When false the bias block is
+   * held at its initial value and decoupled from the rest of the covariance.
+   */
+  bool getEstimateBias() const;
 /// @}
 
 
@@ -144,6 +197,26 @@ the default.
   void setPriorLandmarks(const mapIntVector3d& prior_landmarks);
   /** TODO: Sets magnetic field for untested magnetometer measurement */
   void setMagneticField(const Eigen::Vector3d& true_magnetic_field);
+  /**
+   * Enables or disables estimation of the IMU bias states.
+   *
+   * When disabled the bias block of the covariance is decoupled from the rest of
+   * the state at every correction, which freezes the bias at its initial value.
+   * When enabled the bias is estimated through its cross-covariance with the
+   * attitude/velocity/position block, which is the only path by which contact
+   * kinematics can observe it (the measurement Jacobian H has no bias columns).
+   */
+  void setEstimateBias(const bool estimate_bias);
+  /**
+   * Replaces the state estimate and drops every augmented contact/landmark from
+   * the filter, while keeping the configured noise parameters and error type.
+   *
+   * setState() alone is not sufficient to re-initialize the filter: the maps of
+   * augmented contact and landmark positions index into the state matrix X, so a
+   * stale entry left over from a previous run would index past the end of the
+   * freshly assigned 5x5 X on the next correction.
+   */
+  void resetState(const InEKFState& state);
 /// @}
 
 
@@ -245,6 +318,7 @@ private:
   std::map<int,int> estimated_landmarks_;
   Eigen::Vector3d magnetic_field_;
   Eigen::LDLT<Eigen::MatrixXd> ldlt_;
+  CorrectionInfo last_correction_;
 
   Eigen::MatrixXd StateTransitionMatrix(const Eigen::Vector3d& w, const Eigen::Vector3d& a, double dt);
   Eigen::MatrixXd DiscreteNoiseMatrix(const Eigen::MatrixXd& Phi, double dt);

@@ -186,9 +186,43 @@ public:
   const ContactEstimator& getContactEstimator() const;
 
   ///
-  /// @return const reference to the state estimator settings. 
+  /// @return const reference to the state estimator settings.
   ///
   const LeggedStateEstimatorSettings& getSettings() const;
+
+  ///
+  /// @return const reference to the underlying InEKF, for diagnostics that need
+  /// the raw filter internals (covariance blocks, augmented contact bookkeeping).
+  ///
+  const InEKF& getInEKF() const;
+
+  ///
+  /// @return diagnostics of the most recent InEKF measurement update: whether it
+  /// fired, the innovation and its predicted covariance, the NIS, and which
+  /// contacts were corrected / augmented / marginalized. Valid until the next
+  /// update().
+  ///
+  const CorrectionInfo& getLastCorrection() const;
+
+  ///
+  /// @brief Per-block standard deviations of the InEKF covariance, i.e. the
+  /// square roots of the diagonals of the attitude, velocity, position,
+  /// gyroscope-bias and accelerometer-bias blocks of P. These are the cheapest
+  /// signal that separates "the filter is confident and right" from "the filter
+  /// is confident and wrong".
+  ///
+  Eigen::Vector3d getAttitudeStdDev() const;
+  Eigen::Vector3d getVelocityStdDev() const;
+  Eigen::Vector3d getPositionStdDev() const;
+  Eigen::Vector3d getGyroscopeBiasStdDev() const;
+  Eigen::Vector3d getAccelerometerBiasStdDev() const;
+
+  ///
+  /// @return number of contact landmarks currently augmented into the filter
+  /// state. Differs from the number of scheduled contacts during the update in
+  /// which a contact is added or removed.
+  ///
+  int getNumAugmentedContacts() const;
 
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 

@@ -111,6 +111,26 @@ void InEKF::setMagneticField(const Eigen::Vector3d& true_magnetic_field) { magne
 // Get the true magnetic field
 const Eigen::Vector3d& InEKF::getMagneticField() const { return magnetic_field_; }
 
+// Return diagnostics of the most recent measurement update
+const CorrectionInfo& InEKF::getLastCorrection() const { return last_correction_; }
+
+// Return whether the IMU bias states are estimated
+bool InEKF::getEstimateBias() const { return estimate_bias_; }
+
+// Enable/disable IMU bias estimation
+void InEKF::setEstimateBias(const bool estimate_bias) { estimate_bias_ = estimate_bias; }
+
+// Replace the state and drop every augmented contact/landmark, keeping the noise
+// parameters and error type. The augmented-position maps index into X, so they
+// must be dropped together with the state matrix they refer to.
+void InEKF::resetState(const InEKFState& state) {
+  state_ = state;
+  contacts_.clear();
+  estimated_contact_positions_.clear();
+  estimated_landmarks_.clear();
+  last_correction_.clear();
+}
+
 // Compute Analytical state transition matrix
 Eigen::MatrixXd InEKF::StateTransitionMatrix(const Eigen::Vector3d& w, 
                                              const Eigen::Vector3d& a, 
@@ -323,19 +343,22 @@ void InEKF::CorrectRightInvariant(const Eigen::MatrixXd& Z,
   const int dimTheta = state_.dimTheta();
   const int dimP = state_.dimP();
 
-  // Remove bias
-  Theta = Eigen::Matrix<double,6,1>::Zero();
-  P.block<6,6>(dimP-dimTheta,dimP-dimTheta) = 0.0001*Eigen::Matrix<double,6,6>::Identity();
-  P.block(0,dimP-dimTheta,dimP-dimTheta,dimTheta).setZero();
-  P.block(dimP-dimTheta,0,dimTheta,dimP-dimTheta).setZero();
-  // std::cout << "P:\n" << P << std::endl;
-  // std::cout << state_ << std::endl;
+  // NOTE: this used to unconditionally zero Theta and the bias cross-covariance
+  // here. The measurement Jacobian H has no bias columns, so the ONLY path by
+  // which a kinematic measurement can observe the IMU bias is the
+  // cross-covariance between the bias block and the attitude/velocity/position
+  // block. Zeroing it makes the bias rows of the Kalman gain identically zero,
+  // so dTheta == 0 on every update and the bias can never converge - which made
+  // estimate_bias_ and the configured bias random-walk noise inert. Freezing the
+  // bias when estimate_bias_ is false is already handled in Propagate(), which
+  // decouples the same blocks every step; doing it again here would additionally
+  // discard a deliberately seeded non-zero initial bias.
 
   // Map from left invariant to right invariant error temporarily
   if (error_type_==ErrorType::LeftInvariant) {
     Eigen::MatrixXd Adj = Eigen::MatrixXd::Identity(dimP,dimP);
-    Adj.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(X); 
-    P.noalias() = (Adj * P * Adj.transpose()).eval(); 
+    Adj.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(X);
+    P.noalias() = (Adj * P * Adj.transpose()).eval();
   }
 
   // Compute Kalman Gain
@@ -351,6 +374,13 @@ void InEKF::CorrectRightInvariant(const Eigen::MatrixXd& Z,
     Sinv = ldlt_.solve(Eigen::MatrixXd::Identity(dimS, dimS));
   }
   const Eigen::MatrixXd K = PHT * Sinv;
+
+  // Record innovation diagnostics before the state is overwritten.
+  last_correction_.applied = true;
+  last_correction_.dim = static_cast<int>(Z.rows());
+  last_correction_.innovation = Z.col(0);
+  last_correction_.innovation_std = S.diagonal().cwiseMax(0.0).cwiseSqrt();
+  last_correction_.nis = (Z.col(0).transpose() * Sinv * Z.col(0)).value();
 
   // Compute state correction vector
   const Eigen::VectorXd delta = K*Z;
@@ -372,12 +402,16 @@ void InEKF::CorrectRightInvariant(const Eigen::MatrixXd& Z,
   // Map from right invariant back to left invariant error
   if (error_type_==ErrorType::LeftInvariant) {
     Eigen::MatrixXd AdjInv = Eigen::MatrixXd::Identity(dimP,dimP);
-    AdjInv.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(state_.calcXinv()); 
+    AdjInv.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(state_.calcXinv());
     P_new = (AdjInv * P_new * AdjInv.transpose()).eval();
   }
+  // Re-symmetrize. The Joseph form is symmetric in exact arithmetic, but at
+  // 1 kHz with the adjoint round-trip above the asymmetry accumulates and can
+  // eventually break the LDLT solve of S.
+  P_new = (0.5 * (P_new + P_new.transpose())).eval();
   // Set new covariance
-  state_.setP(P_new); 
-}   
+  state_.setP(P_new);
+}
 
 
 // Correct State: Left-Invariant Observation
@@ -413,6 +447,13 @@ void InEKF::CorrectLeftInvariant(const Eigen::MatrixXd& Z,
   }
   const Eigen::MatrixXd K = PHT * Sinv;
 
+  // Record innovation diagnostics before the state is overwritten.
+  last_correction_.applied = true;
+  last_correction_.dim = static_cast<int>(Z.rows());
+  last_correction_.innovation = Z.col(0);
+  last_correction_.innovation_std = S.diagonal().cwiseMax(0.0).cwiseSqrt();
+  last_correction_.nis = (Z.col(0).transpose() * Sinv * Z.col(0)).value();
+
   // Compute state correction vector
   const Eigen::VectorXd delta = K*Z;
   const Eigen::MatrixXd dX = Exp_SEK3(delta.segment(0,delta.rows()-dimTheta));
@@ -433,13 +474,16 @@ void InEKF::CorrectLeftInvariant(const Eigen::MatrixXd& Z,
   // Map from left invariant back to right invariant error
   if (error_type_==ErrorType::RightInvariant) {
     Eigen::MatrixXd Adj = Eigen::MatrixXd::Identity(dimP,dimP);
-    Adj.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(X_new); 
-    P_new = (Adj * P_new * Adj.transpose()).eval(); 
+    Adj.block(0,0,dimP-dimTheta,dimP-dimTheta) = Adjoint_SEK3(X_new);
+    P_new = (Adj * P_new * Adj.transpose()).eval();
   }
 
+  // See CorrectRightInvariant(): keep P numerically symmetric.
+  P_new = (0.5 * (P_new + P_new.transpose())).eval();
+
   // Set new covariance
-  state_.setP(P_new); 
-}   
+  state_.setP(P_new);
+}
 
 // Correct state using kinematics measured between imu and contact point
 void InEKF::CorrectKinematics(const vectorKinematics& measured_kinematics) {
@@ -449,6 +493,10 @@ void InEKF::CorrectKinematics(const vectorKinematics& measured_kinematics) {
   vector<pair<int,int> > remove_contacts;
   vectorKinematics new_contacts;
   vector<int> used_contact_ids;
+
+  // A call that corrects nothing must not leave the previous call's diagnostics
+  // looking current, so start from a cleared record every time.
+  last_correction_.clear();
 
   for (vectorKinematicsIterator it=measured_kinematics.begin(); it!=measured_kinematics.end(); ++it) {
     // Detect and skip if an ID is not unique (this would cause singularity issues in InEKF::Correct)
@@ -480,6 +528,8 @@ void InEKF::CorrectKinematics(const vectorKinematics& measured_kinematics) {
     } 
     else if (contact_indicated && found) {
       // If contact is indicated and id is found in estimated_contacts_, then correct using kinematics
+      // Record the stacking order so a caller can map innovation segments back to contacts.
+      last_correction_.contact_ids.push_back(it->id);
       const int dimX = state_.dimX();
       const int dimTheta = state_.dimTheta();
       const int dimP = state_.dimP();
@@ -557,7 +607,8 @@ void InEKF::CorrectKinematics(const vectorKinematics& measured_kinematics) {
       for (vector<pair<int,int> >::iterator it2=it; it2!=remove_contacts.end(); ++it2) {
         if (it2->second > it->second) it2->second -= 1;
       }
-      // Remove from list of estimated contact positions 
+      // Remove from list of estimated contact positions
+      last_correction_.removed_contact_ids.push_back(it->first);
       estimated_contact_positions_.erase(it->first);
     }
     // Update state and covariance
@@ -607,6 +658,7 @@ void InEKF::CorrectKinematics(const vectorKinematics& measured_kinematics) {
       state_.setP(P_aug);
 
       // Add to list of estimated contact positions
+      last_correction_.added_contact_ids.push_back(it->id);
       estimated_contact_positions_.insert(pair<int,int> (it->id, startIndex));
     }
   }
