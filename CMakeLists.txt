@@ -46,7 +46,7 @@ add_library(
 target_link_libraries(
   ${PROJECT_NAME} 
   PUBLIC
-  ${PINOCCHIO_LIBRARIES}
+  pinocchio::pinocchio
 )
 target_include_directories(
   ${PROJECT_NAME} 
