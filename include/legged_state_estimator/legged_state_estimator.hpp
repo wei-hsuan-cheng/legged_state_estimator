@@ -238,6 +238,8 @@ private:
   vectorKinematics leg_kinematics_;
   RobotModel robot_model_;
   ContactEstimator contact_estimator_;
+  std::vector<Eigen::Vector3d> surface_normals_;
+  std::vector<double> contact_stance_time_;  // seconds each contact has been in stance
   LowPassFilter<double, 3> lpf_gyro_accel_world_, lpf_lin_accel_world_;
   LowPassFilter<double, Eigen::Dynamic> lpf_dqJ_, lpf_ddqJ_, lpf_tauJ_;
   Vector3d imu_gyro_raw_world_, imu_gyro_raw_world_prev_, imu_gyro_accel_world_, 

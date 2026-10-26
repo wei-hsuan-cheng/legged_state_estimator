@@ -131,6 +131,8 @@ void LeggedStateEstimator::init(const Eigen::Vector3d& base_pos,
   lpf_dqJ_.reset();
   lpf_ddqJ_.reset();
   lpf_tauJ_.reset();
+  contact_estimator_.reset();
+  contact_stance_time_.assign(contact_stance_time_.size(), 0.0);
 }
 
 
@@ -243,31 +245,60 @@ void LeggedStateEstimator::updateImpl(
   lpf_tauJ_.update(tauJ);
   // Update contact info
   robot_model_.updateLegKinematics(qJ);
+  // Torque-based contact estimate. It drives the contacts when none are supplied and runs as
+  // a diagnostic otherwise, so a detector can be compared against supplied contacts live.
+  // Inverse dynamics at the estimated base attitude, so gravity loads the joints in the
+  // right direction even when the trunk leans. The accelerometer measures the specific
+  // force f = R^T (a - g); Pinocchio adds -g itself, so the base acceleration it needs is
+  // f + R^T g (zero when the base is at rest), not f.
+  const Eigen::Vector3d gravity_local =
+      getBaseRotationEstimate().transpose() * Eigen::Vector3d(0.0, 0.0, -9.81);
+  if (settings_.dynamic_contact_estimation) {
+    robot_model_.updateDynamics(Eigen::Vector3d::Zero(), getBaseQuaternionEstimate(),
+                                getBaseLinearVelocityEstimateLocal(),
+                                imu_gyro_raw - getIMUGyroBiasEstimate(),
+                                imu_lin_accel_local_ + gravity_local, imu_gyro_accel_local_,
+                                qJ, lpf_dqJ_.getEstimate(), lpf_ddqJ_.getEstimate());
+  }
+  else {
+    robot_model_.updateDynamics(Eigen::Vector3d::Zero(), getBaseQuaternionEstimate(),
+                                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                                Eigen::Vector3d::Zero(), Eigen::Vector3d::Zero(),
+                                qJ, lpf_dqJ_.getEstimate(), Eigen::VectorXd::Zero(robot_model_.nJ()));
+  }
+  // The contact Jacobians are taken with the base at the identity (updateLegKinematics), so
+  // forces are in the base frame and the ground normal there is R^T e_z.
+  surface_normals_.assign(static_cast<size_t>(robot_model_.numContacts()),
+                          getBaseRotationEstimate().transpose().col(2));
+  contact_estimator_.setContactSurfaceNormal(surface_normals_);
+  contact_estimator_.update(robot_model_, lpf_tauJ_.getEstimate());
   if (external_contact_state != nullptr) {
     inekf_.setContacts(*external_contact_state);
   }
   else {
-    if (settings_.dynamic_contact_estimation) {
-      robot_model_.updateDynamics(getBasePositionEstimate(), getBaseQuaternionEstimate(),
-                                  getBaseLinearVelocityEstimateLocal(), imu_gyro_raw,
-                                  imu_lin_accel_local_, imu_gyro_accel_local_,
-                                  qJ, dqJ, lpf_ddqJ_.getEstimate());
-    }
-    else {
-      robot_model_.updateLegDynamics(qJ, dqJ);
-    }
-    contact_estimator_.update(robot_model_, lpf_tauJ_.getEstimate());
     inekf_.setContacts(contact_estimator_.getContactState());
   }
   const double minimum_contact_covariance =
       settings_.contact_position_noise * settings_.contact_position_noise;
+  const double settle_covariance =
+      settings_.contact_settle_position_noise * settings_.contact_settle_position_noise;
+  const auto& used_contacts = external_contact_state != nullptr ?
+      *external_contact_state : contact_estimator_.getContactState();
+  contact_stance_time_.resize(static_cast<size_t>(robot_model_.numContacts()), 0.0);
+  for (const auto& [id, in_stance] : used_contacts) {
+    double& stance_time = contact_stance_time_[static_cast<size_t>(id)];
+    stance_time = in_stance ? stance_time + settings_.sampling_time : 0.0;
+  }
   for (int i=0; i<robot_model_.numContacts(); ++i) {
     leg_kinematics_[i].setContactPosition(
         robot_model_.getContactPosition(i)-robot_model_.getBasePosition());
-    const double contact_force_cov = external_contact_state != nullptr ?
+    double contact_force_cov = external_contact_state != nullptr ?
         minimum_contact_covariance :
         std::max(minimum_contact_covariance,
                  contact_estimator_.getContactForceCovariance()[i]);
+    if (contact_stance_time_[i] > 0.0 && contact_stance_time_[i] <= settings_.contact_settle_time) {
+      contact_force_cov = std::max(contact_force_cov, settle_covariance);
+    }
     leg_kinematics_[i].setContactPositionCovariance(
         contact_force_cov*Eigen::Matrix3d::Identity());
   }

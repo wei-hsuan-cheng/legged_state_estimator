@@ -1,6 +1,9 @@
 #include "legged_state_estimator/contact_estimator.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
+#include <string>
 
 
 namespace legged_state_estimator {
@@ -10,33 +13,59 @@ ContactEstimator::ContactEstimator(const RobotModel& robot_model,
   : settings_(settings),
     contact_force_estimate_(robot_model.numContacts(), Eigen::Vector3d::Zero()),
     contact_force_estimate_prev_(robot_model.numContacts(), Eigen::Vector3d::Zero()),
-    contact_surface_normal_(robot_model.numContacts(), Eigen::Vector3d::Zero()),
+    contact_surface_normal_(robot_model.numContacts(), Eigen::Vector3d::UnitZ()),
     normal_contact_force_estimate_(robot_model.numContacts(), 0),
     normal_contact_force_estimate_prev_(robot_model.numContacts(), 0),
     contact_probability_(robot_model.numContacts(), 0),
     contact_force_covariance_(robot_model.numContacts(), 0),
     contact_state_(),
     num_contacts_(robot_model.numContacts()) {
-  if (settings.beta0.size() != 4) {
+  const auto n = static_cast<size_t>(num_contacts_);
+  if (settings.beta0.size() != n || settings.beta1.size() != n) {
     throw std::invalid_argument(
-        "[ContactEstimator] invalid argment: settings.beta0.size() must be 4");
+        "[ContactEstimator] invalid argment: settings.beta0 and beta1 need one entry per contact ("
+        + std::to_string(n) + ")");
   }
-  if (settings.beta1.size() != 4) {
+  if (settings.contact_probability_threshold <= 0 || settings.contact_probability_threshold >= 1.0) {
     throw std::invalid_argument(
-        "[ContactEstimator] invalid argment: settings.beta1.size() must be 4");
+        "[ContactEstimator] invalid argment: settings.contact_probability_threshold must be in (0, 1)");
   }
+  if (settings.contact_release_probability_threshold >= 1.0) {
+    throw std::invalid_argument(
+        "[ContactEstimator] invalid argment: settings.contact_release_probability_threshold must be below 1");
+  }
+  if (settings.force_regularization < 0) {
+    throw std::invalid_argument(
+        "[ContactEstimator] invalid argment: settings.force_regularization must be non-negative");
+  }
+  // Groups: renumber densely so any labels work, e.g. foot indices [0, 0, 1, 1].
+  if (!settings.contact_groups.empty() && settings.contact_groups.size() != n) {
+    throw std::invalid_argument(
+        "[ContactEstimator] invalid argment: settings.contact_groups needs one entry per contact or none");
+  }
+  group_of_contact_.assign(n, 0);
+  std::vector<int> labels;
+  for (size_t i = 0; i < n; ++i) {
+    const int label = settings.contact_groups.empty() ? static_cast<int>(i) : settings.contact_groups[i];
+    const auto it = std::find(labels.begin(), labels.end(), label);
+    group_of_contact_[i] = static_cast<int>(it - labels.begin());
+    if (it == labels.end()) {
+      labels.push_back(label);
+      first_contact_of_group_.push_back(static_cast<int>(i));
+    }
+  }
+  num_groups_ = static_cast<int>(labels.size());
+  group_normal_force_.assign(labels.size(), 0.0);
+  group_normal_force_prev_.assign(labels.size(), 0.0);
+  group_state_.assign(labels.size(), false);
 
-  if (settings.contact_probability_threshold <= 0) {
-    throw std::invalid_argument(
-        "[ContactEstimator] invalid argment: settings.contact_probability_threshold must be positive");
-  }
-  if (settings.contact_probability_threshold >= 1.0) {
-    throw std::invalid_argument(
-        "[ContactEstimator] invalid argment: settings.contact_probability_threshold must be less than 1.0");
-  }
-  for (auto& e : contact_surface_normal_) {
-    e << 0, 0, 1;
-  }
+  const int nJ = robot_model.nJ();
+  jacobian_.setZero(3 * num_contacts_, nJ);
+  normal_matrix_.setZero(3 * num_contacts_, 3 * num_contacts_);
+  residual_.setZero(nJ);
+  projected_residual_.setZero(3 * num_contacts_);
+  forces_.setZero(3 * num_contacts_);
+  solver_ = Eigen::LDLT<Eigen::MatrixXd>(3 * num_contacts_);
   contact_state_.clear();
   for (int i=0; i<num_contacts_; ++i) {
     contact_state_.push_back(std::pair<int, bool>(i, false));
@@ -59,39 +88,62 @@ ContactEstimator::ContactEstimator()
 
 
 void ContactEstimator::reset() {
+  std::fill(group_state_.begin(), group_state_.end(), false);
+  std::fill(group_normal_force_prev_.begin(), group_normal_force_prev_.end(), 0.0);
+  for (auto& e : contact_state_) {
+    e.second = false;
+  }
 }
 
 
 void ContactEstimator::update(const RobotModel& robot_model, 
                               const Eigen::VectorXd& tauJ) {
-  // Estimate contact force from robot dynamics via logistic regression
+  // Contact forces from the joint rows of the dynamics: tau - tau_ID = -Jc^T f, solved for
+  // all contacts at once as f = -(Jc Jc^T + lambda I)^-1 Jc (tau - tau_ID).
   for (int i=0; i<num_contacts_; ++i) {
-    contact_force_estimate_[i].noalias() 
-        = - robot_model.getJointContactJacobian(i).template block<3, 3>(0, i*3).transpose().inverse() 
-            * (tauJ.template segment<3>(3*i)-robot_model.getJointInverseDynamics().template segment<3>(3*i));
+    jacobian_.middleRows(3*i, 3) = robot_model.getJointContactJacobian(i);
+  }
+  residual_ = tauJ - robot_model.getJointInverseDynamics();
+  normal_matrix_.noalias() = jacobian_ * jacobian_.transpose();
+  normal_matrix_.diagonal().array() += settings_.force_regularization;
+  projected_residual_.noalias() = jacobian_ * residual_;
+  solver_.compute(normal_matrix_);
+  forces_ = -solver_.solve(projected_residual_);
+
+  for (int i=0; i<num_contacts_; ++i) {
+    contact_force_estimate_[i] = forces_.segment<3>(3*i);
     normal_contact_force_estimate_[i] = contact_force_estimate_[i].dot(contact_surface_normal_[i]);
   }
-  // Contact probability 
+  std::fill(group_normal_force_.begin(), group_normal_force_.end(), 0.0);
   for (int i=0; i<num_contacts_; ++i) {
-    contact_probability_[i]
-        = 1.0 / (1.0 + std::exp(- settings_.beta1[i] * normal_contact_force_estimate_[i]
-                                - settings_.beta0[i]));
-    if (std::isnan(contact_probability_[i]) || std::isinf(contact_probability_[i])) {
-      contact_probability_[i] = 0;
+    group_normal_force_[group_of_contact_[i]] += normal_contact_force_estimate_[i];
+  }
+  // One decision per rigid body, on its summed normal force, with hysteresis.
+  const double release = settings_.contact_release_probability_threshold < 0 ?
+      settings_.contact_probability_threshold : settings_.contact_release_probability_threshold;
+  for (int g=0; g<num_groups_; ++g) {
+    const int first = first_contact_of_group_[g];
+    double probability = 1.0 / (1.0 + std::exp(- settings_.beta1[first] * group_normal_force_[g]
+                                                - settings_.beta0[first]));
+    if (!std::isfinite(probability)) {
+      probability = 0.0;
+    }
+    group_state_[g] = probability >= (group_state_[g] ? release : settings_.contact_probability_threshold);
+    const double df = group_normal_force_[g] - group_normal_force_prev_[g];
+    group_normal_force_prev_[g] = group_normal_force_[g];
+    const double point_force = settings_.contact_point_force_ratio * std::max(group_normal_force_[g], 0.0);
+    for (int i=0; i<num_contacts_; ++i) {
+      if (group_of_contact_[i] == g) {
+        contact_probability_[i] = probability;
+        contact_force_covariance_[i] = settings_.contact_force_covariance_alpha * df * df;
+        contact_state_[i].second = group_state_[g] &&
+            (settings_.contact_point_force_ratio <= 0.0 || normal_contact_force_estimate_[i] >= point_force);
+      }
     }
   }
-  // Contact covariance
   for (int i=0; i<num_contacts_; ++i) {
-    const double df = normal_contact_force_estimate_[i] - normal_contact_force_estimate_prev_[i];
-    contact_force_covariance_[i] = settings_.contact_force_covariance_alpha * df * df;
     contact_force_estimate_prev_[i] = contact_force_estimate_[i];
     normal_contact_force_estimate_prev_[i] = normal_contact_force_estimate_[i];
-  }
-  // Deterministic contact state
-  contact_state_.clear();
-  for (int i=0; i<num_contacts_; ++i) {
-    contact_state_.push_back(
-        std::pair<int, bool>(i, (contact_probability_[i] >= settings_.contact_probability_threshold)));
   }
 }
 

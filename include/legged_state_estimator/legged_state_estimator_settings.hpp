@@ -60,6 +60,20 @@ public:
   double contact_rotation_noise;
 
   ///
+  /// @brief For this long after a contact enters stance [s], its kinematic measurement uses
+  /// contact_settle_position_noise instead of contact_position_noise, also for the new landmark's
+  /// initial covariance. A landing foot is not a fixed point yet (a flat foot lands on its heel and
+  /// rolls onto its toe, a foot conforms to an edge), so the landmark follows the foot while it
+  /// settles instead of pulling the base. 0 disables.
+  ///
+  double contact_settle_time = 0.0;
+
+  ///
+  /// @brief Kinematic measurement noise of a settling contact [m].
+  ///
+  double contact_settle_position_noise = 0.05;
+
+  ///
   /// @brief Time step of estimation.
   ///
   double sampling_time;
